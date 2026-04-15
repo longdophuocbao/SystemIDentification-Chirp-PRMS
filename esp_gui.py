@@ -4,6 +4,7 @@ import serial.tools.list_ports
 import threading
 import time
 import csv
+import struct
 import os
 from datetime import datetime
 from collections import deque
@@ -11,51 +12,160 @@ import numpy as np
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 
+# ── CRC-16/CCITT (polynomial 0x1021, init 0xFFFF) ─────────────
+# Phải khớp hoàn toàn với hàm crc16_ccitt() trong main.cpp
+def crc16_ccitt(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+            crc &= 0xFFFF
+    return crc
+
+# ── Hằng số packet ─────────────────────────────────────────────
+PKT_SYNC1       = 0xAA
+PKT_SYNC2       = 0x55
+PKT_PAYLOAD_LEN = 8   # t_ms(4) + pwm_i16(2) + alpha_i16(2)
+PKT_TOTAL_LEN   = 12  # sync(2) + payload(8) + crc16(2)
+
 class SerialReader(QtCore.QObject):
-    """Serial reader thread — emits signals to the UI"""
-    data_received = QtCore.pyqtSignal(float, float, float) # t_ms, pwm, alpha
+    """
+    Serial reader thread — giao thức nhị phân + ASCII comment.
+
+    Packet data (12 bytes):
+      [0]    0xAA          sync1
+      [1]    0x55          sync2
+      [2-5]  uint32_t      t_ms     (little-endian)
+      [6-7]  int16_t       pwm×100
+      [8-9]  int16_t       alpha×100
+      [10-11] uint16_t     CRC-16/CCITT của bytes [2..9]
+
+    Comment (ASCII):  bắt đầu bằng '#', kết thúc bằng '\\n'
+
+    State machine:
+      SYNC1 → SYNC2 → PAYLOAD(10 bytes) → validate → emit
+      Nếu byte == '#' → chuyển sang COMMENT mode
+    """
+    data_received    = QtCore.pyqtSignal(float, float, float)  # t_ms, pwm, alpha
     message_received = QtCore.pyqtSignal(str)
+
+    _ST_SYNC1   = 0
+    _ST_SYNC2   = 1
+    _ST_PAYLOAD = 2   # đọc PKT_PAYLOAD_LEN + 2 (payload + crc)
+    _ST_COMMENT = 3   # đọc ASCII đến '\n'
 
     def __init__(self, port, baud=460800):
         super().__init__()
-        self.port = port
-        self.baud = baud
+        self.port    = port
+        self.baud    = baud
         self.running = False
-        self.ser = None
+        self.ser     = None
+        self._reset_parser()
 
+    def _reset_parser(self):
+        self._state   = self._ST_SYNC1
+        self._buf     = bytearray()   # payload+crc buffer (max 10 bytes)
+        self._comment = bytearray()   # comment line buffer
+        self._pending = []            # bytes chờ resync sau CRC fail
+        self._pkt_ok  = 0
+        self._pkt_err = 0
+
+    # ── Parser byte-by-byte ────────────────────────────────────
+    def _feed(self, b: int):
+        s = self._state
+
+        if s == self._ST_SYNC1:
+            if b == PKT_SYNC1:
+                self._state = self._ST_SYNC2
+            elif b == ord('#'):
+                self._comment = bytearray(b'#')
+                self._state   = self._ST_COMMENT
+
+        elif s == self._ST_SYNC2:
+            if b == PKT_SYNC2:
+                self._buf   = bytearray()
+                self._state = self._ST_PAYLOAD
+            elif b == PKT_SYNC1:
+                pass                      # 0xAA 0xAA → chờ 0x55 tiếp
+            else:
+                self._state = self._ST_SYNC1
+
+        elif s == self._ST_PAYLOAD:
+            self._buf.append(b)
+            if len(self._buf) == PKT_PAYLOAD_LEN + 2:   # payload(8)+crc(2)
+                self._validate()          # sẽ set _state và _pending nếu cần
+                # _validate đặt _state = SYNC1 hoặc đẩy bytes vào _pending
+
+        elif s == self._ST_COMMENT:
+            if b == ord('\n'):
+                line = self._comment.decode('utf-8', errors='replace').strip()
+                self.message_received.emit(line)
+                self._state = self._ST_SYNC1
+            else:
+                self._comment.append(b)
+                if len(self._comment) > 256:
+                    self._state = self._ST_SYNC1
+
+    def _validate(self):
+        """Kiểm tra CRC. Nếu OK: emit. Nếu FAIL: quét buf tìm 0xAA để resync."""
+        payload  = bytes(self._buf[:PKT_PAYLOAD_LEN])
+        crc_recv = struct.unpack_from('<H', self._buf, PKT_PAYLOAD_LEN)[0]
+
+        if crc16_ccitt(payload) != crc_recv:
+            self._pkt_err += 1
+            # ── Resync heuristic ────────────────────────────────
+            # Quét buf (bỏ byte 0) tìm 0xAA — đó có thể là sync của packet sau
+            # Đưa các bytes từ 0xAA đó vào _pending để xử lý lại sau khi return
+            for k in range(1, len(self._buf)):
+                if self._buf[k] == PKT_SYNC1:
+                    self._pending = list(self._buf[k:])  # 0xAA + bytes còn lại
+                    break
+            self._state = self._ST_SYNC1
+            return
+
+        # ── CRC OK: parse và emit ────────────────────────────────
+        t_ms, pwm_raw, alpha_raw = struct.unpack_from('<Ihh', payload)
+        self._pkt_ok += 1
+        self.data_received.emit(float(t_ms), pwm_raw / 100.0, alpha_raw / 100.0)
+        self._state = self._ST_SYNC1
+
+    # ── Main loop ──────────────────────────────────────────────
     def start(self):
         try:
             self.ser = serial.Serial(self.port, self.baud, timeout=0.1)
+            self._reset_parser()
             self.running = True
-            while self.running:
-                if self.ser.in_waiting > 0:
-                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
-                    if not line: continue
 
-                    if line.startswith('#'):
-                        self.message_received.emit(line)
-                    else:
-                        parts = line.split(',')
-                        if len(parts) == 3:
-                            try:
-                                t = float(parts[0])
-                                p = float(parts[1])
-                                a = float(parts[2])
-                                self.data_received.emit(t, p, a)
-                            except ValueError: pass
+            while self.running:
+                n = self.ser.in_waiting
+                if n > 0:
+                    chunk = self.ser.read(n)
+                    for b in chunk:
+                        self._feed(b)
+                        # Xử lý bytes resync (nếu CRC vừa fail và tìm thấy 0xAA trong buf)
+                        while self._pending:
+                            self._feed(self._pending.pop(0))
                 else:
                     time.sleep(0.001)
+
         except Exception as e:
             self.message_received.emit(f"# ERROR: {str(e)}")
         finally:
-            if self.ser: self.ser.close()
+            if self.ser:
+                self.ser.close()
 
     def stop(self):
         self.running = False
 
-    def send(self, cmd):
+    def send(self, cmd: str):
         if self.ser and self.ser.is_open:
             self.ser.write((cmd + '\n').encode('utf-8'))
+
+    def stats(self) -> str:
+        total = self._pkt_ok + self._pkt_err
+        rate  = self._pkt_err / total * 100 if total else 0
+        return f"Packets: {self._pkt_ok} OK  {self._pkt_err} ERR ({rate:.1f}%)"
 
 class RealTimeGui(QtWidgets.QMainWindow):
     def __init__(self):
@@ -158,7 +268,7 @@ class RealTimeGui(QtWidgets.QMainWindow):
         prms_form = QtWidgets.QFormLayout(prms_page)
         prms_form.setContentsMargins(0, 0, 0, 0)
 
-        self.prms_clock_ms = QtWidgets.QLineEdit("4000")
+        self.prms_clock_ms = QtWidgets.QLineEdit("1000")
         self.prms_clock_ms.setToolTip(
             "Thời gian giữ mỗi bước (ms). Phải >= 20ms (chu kỳ lấy mẫu).\n"
             "Theo bài báo: clock_ms = 1000 / (2.5 × f_bandwidth)\n"
@@ -167,36 +277,28 @@ class RealTimeGui(QtWidgets.QMainWindow):
             "  BW = 5.0 Hz → clock_ms = 80 ms"
         )
 
-        self.prms_levels = QtWidgets.QComboBox()
-        for lv in ["2", "3", "5", "7", "9"]:
-            self.prms_levels.addItem(lv)
-        self.prms_levels.setCurrentIndex(1)  # mặc định 3 mức
-        self.prms_levels.setToolTip(
-            "Số mức biên độ:\n"
-            "  3 mức → {-A, 0, +A}          (đơn giản, an toàn)\n"
-            "  5 mức → {-A, -A/2, 0, +A/2, +A}  (gần giống bài báo)\n"
-            "  7, 9 mức → kích thích phi tuyến tốt hơn\n"
-            "Nhiều mức hơn = gần với PRBS×random_amp của bài báo."
-        )
-
-        self.prms_seed = QtWidgets.QLineEdit("1")
+        self.prms_seed = QtWidgets.QLineEdit("1000")
         self.prms_seed.setToolTip(
-            "Giá trị khởi đầu LFSR [1–32767].\n"
-            "Thay đổi seed → chuỗi khác, cùng tính chất thống kê.\n"
+            "Seed cho LFSR_PRBS [1–32767].\n"
+            "LFSR_Amp seed = seed XOR 0x55AA (tự động, độc lập thống kê).\n"
+            "Thay đổi seed → chuỗi khác, cùng tính chất phổ.\n"
             "Chu kỳ LFSR 15-bit = 32767 bước."
         )
 
-        # Thêm nhãn hướng dẫn thiết kế
-        self.prms_hint = QtWidgets.QLabel(
-            "<small><i>clock_ms = 1000 / (2.5 × BW_Hz) | "
-            "duration ≥ 127 × clock_s</i></small>"
+        # Nhãn giải thích phương pháp
+        self.prms_method_label = QtWidgets.QLabel(
+            "<small><b>PRMS = PRBS_sign × Uniform_random_amp</b><br>"
+            "Biên độ phân bố đều trong [−A, +A] — theo Roman et al.<br>"
+            "<i>clock_ms = 1000 / (2.5 × BW_Hz) &nbsp;|&nbsp; duration ≥ 127 × clock_s</i></small>"
         )
-        self.prms_hint.setStyleSheet("color: #888; padding: 2px;")
+        self.prms_method_label.setStyleSheet(
+            "color: #aaa; padding: 3px; border: 1px solid #444; border-radius: 3px;"
+        )
+        self.prms_method_label.setWordWrap(True)
 
         prms_form.addRow("Clock Period (ms):", self.prms_clock_ms)
-        prms_form.addRow("Levels:", self.prms_levels)
         prms_form.addRow("LFSR Seed:", self.prms_seed)
-        prms_form.addRow(self.prms_hint)
+        prms_form.addRow(self.prms_method_label)
         self.sig_stack.addWidget(prms_page)
 
         sig_outer.addWidget(self.sig_stack)
@@ -212,7 +314,7 @@ class RealTimeGui(QtWidgets.QMainWindow):
         common_form.setContentsMargins(0, 0, 0, 0)
         self.amplitude = QtWidgets.QLineEdit("0.5")
         self.offset    = QtWidgets.QLineEdit("0.0")
-        self.duration  = QtWidgets.QLineEdit("508")
+        self.duration  = QtWidgets.QLineEdit("100")
         common_form.addRow("Amplitude (0–0.85):", self.amplitude)
         common_form.addRow("Offset PWM:", self.offset)
         common_form.addRow("Duration (s):", self.duration)
@@ -242,9 +344,9 @@ class RealTimeGui(QtWidgets.QMainWindow):
         manual_layout = QtWidgets.QVBoxLayout()
 
         dir_label_layout = QtWidgets.QHBoxLayout()
-        lbl_fwd = QtWidgets.QLabel("◀ UP")
+        lbl_fwd = QtWidgets.QLabel("◀ DOWN")
         lbl_fwd.setStyleSheet("color: #28a745; font-weight: bold;")
-        lbl_rev = QtWidgets.QLabel("DOWN ▶")
+        lbl_rev = QtWidgets.QLabel("UP ▶")
         lbl_rev.setStyleSheet("color: #dc3545; font-weight: bold;")
         dir_label_layout.addWidget(lbl_fwd)
         dir_label_layout.addStretch()
@@ -311,7 +413,7 @@ class RealTimeGui(QtWidgets.QMainWindow):
 
         self.pw_pwm = pg.PlotWidget(title="PWM Control (%)")
         self.pw_pwm.showGrid(x=True, y=True)
-        self.pw_pwm.setYRange(-100, 100)
+        self.pw_pwm.setYRange(-1, 1)
         self.curve_pwm = self.pw_pwm.plot(pen=pg.mkPen('r', width=1.5))
         plot_layout.addWidget(self.pw_pwm)
 
@@ -388,10 +490,11 @@ class RealTimeGui(QtWidgets.QMainWindow):
             cmd = (f"w {self.f_start.text()} {self.f_end.text()} "
                    f"{self.amplitude.text()} {self.offset.text()} {self.duration.text()}")
         else:
-            # PRMS: r <amplitude> <offset> <clock_ms> <duration> <num_levels> <seed>
+            # PRMS: r <amplitude> <offset> <clock_ms> <duration> <seed>
+            # PRMS = PRBS_sign × Uniform_random_amp  (theo Roman et al.)
             cmd = (f"r {self.amplitude.text()} {self.offset.text()} "
                    f"{self.prms_clock_ms.text()} {self.duration.text()} "
-                   f"{self.prms_levels.currentText()} {self.prms_seed.text()}")
+                   f"{self.prms_seed.text()}")
 
         self.reader.send(cmd)
         self.log_output.append(f"<b>[CMD]</b> Sent: <code>{cmd}</code>")
@@ -434,8 +537,11 @@ class RealTimeGui(QtWidgets.QMainWindow):
         if self.csv_file:
             self.csv_file.write(msg + "\n")
 
-        # Đóng CSV khi thí nghiệm kết thúc
+        # Đóng CSV khi thí nghiệm kết thúc + in thống kê packet
         if "# SWEEP_COMPLETE" in msg:
+            if hasattr(self, 'reader'):
+                stats = self.reader.stats()
+                self.log_output.append(f"<font color='#74c0fc'><b>[STATS] {stats}</b></font>")
             self.close_csv()
 
     def update_plots(self):

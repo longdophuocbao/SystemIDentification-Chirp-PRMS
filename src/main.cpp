@@ -11,27 +11,28 @@
  *       IN2 (nghịch): writeScaled(duty) khi pwm_val < 0
  *       Kênh không dùng → writeScaled(0.0)
  *
- *  Giao tiếp Serial (115200 baud):
- *    "w <f_start> <f_end> <amplitude> <offset> <duration>"
- *                       — bắt đầu logarithmic chirp sweep
- *    "r <amplitude> <offset> <clock_ms> <duration> <num_levels> <seed>"
- *                       — bắt đầu PRMS (Pseudo-Random Multi-level Sequence)
- *    "s"          — dừng khẩn cấp
- *    "m <val>"    — PWM thủ công (-0.85 đến +0.85)
- *    "p <val>"    — test PWM 200ms rồi tự tắt
- *    "d"          — đọc alpha ngay
- *    "?"          — xem trạng thái
+ *  Giao tiếp Serial (460800 baud):
+ *    LỆNH ĐẾN (ASCII, từ PC):
+ *      "w <f_start> <f_end> <amplitude> <offset> <duration>"
+ *      "r <amplitude> <offset> <clock_ms> <duration> <seed>"
+ *      "s"  "m <val>"  "p <val>"  "d"  "?"
  *
- *  Output Serial (CSV):
- *    # comment lines bắt đầu bằng '#'
- *    t_ms, pwm_pct, alpha_deg
+ *    DỮ LIỆU RA (Binary packet, 12 bytes):
+ *      [0x00] 0xAA          sync byte 1
+ *      [0x01] 0x55          sync byte 2
+ *      [0x02-05] uint32_t   t_ms  (little-endian)
+ *      [0x06-07] int16_t    pwm_pct × 100  (e.g. 5023 = 50.23%)
+ *      [0x08-09] int16_t    alpha_deg × 100 (e.g. 2150 = 21.50°)
+ *      [0x0A-0B] uint16_t   CRC-16/CCITT của bytes [2..9]
+ *      → 12 bytes vs 21 bytes ASCII = 43% nhẹ hơn
+ *
+ *    COMMENT (ASCII, luôn bắt đầu bằng '#'):
+ *      # STATUS / ERROR / SWEEP_COMPLETE v.v.
  *
  *  PRMS:
- *    Dùng LFSR 15-bit (polynomial x^15 + x^14 + 1) để sinh
- *    chuỗi giả ngẫu nhiên độ dài 32767 bước, sau đó ánh xạ
- *    sang num_levels mức đều nhau trong [-amplitude, +amplitude].
- *    Mỗi bước giữ nguyên giá trị trong clock_ms milli-giây.
- *    Ví dụ: 3 mức = {-A, 0, +A}; 5 mức = {-A, -A/2, 0, A/2, +A}.
+ *    PRMS = PRBS_sign × Uniform_random_amplitude (Roman et al.)
+ *    Dùng 2 LFSR 15-bit độc lập (polynomial x^15 + x^14 + 1)
+ *    Chu kỳ 32767 bước. clock_ms = 1000/(2.5×BW_Hz).
  * ============================================================
  */
 
@@ -42,19 +43,69 @@
 #include <ESP32Servo.h>
 
 // ============================================================
+//  BINARY PROTOCOL — DATA PACKET (12 bytes)
+//  Phân biệt với comment ASCII bằng byte đầu tiên:
+//    0xAA → binary data packet
+//    '#'  → ASCII comment line (đến '\n')
+// ============================================================
+#define PKT_SYNC1        0xAA
+#define PKT_SYNC2        0x55
+#define PKT_PAYLOAD_LEN  8     // t_ms(4) + pwm_i16(2) + alpha_i16(2)
+#define PKT_TOTAL_LEN    12    // sync(2) + payload(8) + crc16(2)
+
+// CRC-16/CCITT  polynomial 0x1021, init 0xFFFF
+// Tính trên 8 bytes payload [t_ms | pwm_raw | alpha_raw]
+static uint16_t crc16_ccitt(const uint8_t* data, uint8_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t b = 0; b < 8; b++)
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+    }
+    return crc;
+}
+
+// Gửi 1 data packet nhị phân: 12 bytes, non-blocking (ghi vào TX HW buffer)
+static void send_data_packet(uint32_t t_ms, float pwm_pct, float alpha_deg) {
+    // Payload: t_ms(4) + pwm_raw(2) + alpha_raw(2) — little-endian
+    uint8_t pay[PKT_PAYLOAD_LEN];
+    pay[0] = (uint8_t)(t_ms);
+    pay[1] = (uint8_t)(t_ms >>  8);
+    pay[2] = (uint8_t)(t_ms >> 16);
+    pay[3] = (uint8_t)(t_ms >> 24);
+    int16_t pwm_raw   = (int16_t)(pwm_pct   * 100.0f);
+    int16_t alpha_raw = (int16_t)(alpha_deg * 100.0f);
+    pay[4] = (uint8_t)(pwm_raw);
+    pay[5] = (uint8_t)(pwm_raw   >> 8);
+    pay[6] = (uint8_t)(alpha_raw);
+    pay[7] = (uint8_t)(alpha_raw >> 8);
+
+    uint16_t crc = crc16_ccitt(pay, PKT_PAYLOAD_LEN);
+
+    uint8_t pkt[PKT_TOTAL_LEN];
+    pkt[0]  = PKT_SYNC1;
+    pkt[1]  = PKT_SYNC2;
+    memcpy(pkt + 2, pay, PKT_PAYLOAD_LEN);
+    pkt[10] = (uint8_t)(crc);
+    pkt[11] = (uint8_t)(crc >> 8);
+
+    Serial.write(pkt, PKT_TOTAL_LEN);
+}
+
+// ============================================================
 //  CẤU HÌNH PHẦN CỨNG — chỉnh sửa tại đây cho phù hợp
 // ============================================================
 
 // I2C cho ADS1115
-#define PIN_SDA         25
-#define PIN_SCL         26
+#define PIN_SDA         14
+#define PIN_SCL         13
 
 // H-bridge: 2 kênh PWM độc lập
-#define PIN_MOTOR_IN1   18
-#define PIN_MOTOR_IN2   19
+#define PIN_MOTOR_IN1   33
+#define PIN_MOTOR_IN2   32
 
 // Cài đặt PWM
-#define PWM_FREQ_HZ     20000
+#define PWM_FREQ_HZ     10000
 #define PWM_BITS        10
 
 // Chu kỳ lấy mẫu và điều khiển
@@ -95,13 +146,15 @@ struct SweepParams {
 };
 
 // Tham số PRMS — được set qua lệnh 'r'
+// Theo bài báo Roman et al.: PRMS = PRBS_sign × Uniform_random_amplitude
 struct PRMSParams {
-    float    amplitude  = 0.5f;
-    float    offset     = 0.0f;
-    uint16_t clock_ms   = 100;   // thời gian giữ mỗi bước (ms)
-    float    duration   = 60.0f;
-    int      num_levels = 3;     // số mức: 3 hoặc 5 thường dùng
-    uint16_t seed       = 1;     // giá trị khởi đầu LFSR (1 – 32767)
+    float    amplitude = 0.5f;
+    float    offset    = 0.0f;
+    uint16_t clock_ms  = 4000;  // thời gian giữ mỗi bước (ms)
+                                // = 1000 / (2.5 × bandwidth_Hz)
+    float    duration  = 508.0f;
+    uint16_t seed      = 1;     // seed cho LFSR_PRBS (1 – 32767)
+                                // LFSR_Amp dùng seed ^ 0x55AA tự động
 };
 
 volatile SweepState  sweepState   = STATE_IDLE;
@@ -112,8 +165,12 @@ PRMSParams           prmsParams;
 
 unsigned long        phaseStartMs  = 0;
 
-// PRMS runtime state
-volatile uint16_t    g_lfsrState    = 1;
+// PRMS runtime state — 2 LFSR độc lập (theo bài báo Roman et al.)
+//   g_lfsrPRBS : sinh chuỗi nhị phân ±1 (bit 0 = dấu)
+//   g_lfsrAmp  : sinh biên độ ngẫu nhiên đều trong [0, A]
+//   Output     = sign × (g_lfsrAmp / 32767) × A  ∈ [-A, +A]
+volatile uint16_t    g_lfsrPRBS     = 1;
+volatile uint16_t    g_lfsrAmp      = 1;
 volatile int         g_prmsLastTick = -1;
 volatile float       g_prmsOutput   = 0.0f;
 
@@ -161,25 +218,28 @@ float logChirp(float t, float f1, float f2, float T, float amplitude) {
 
 // ============================================================
 //  HÀM LFSR 15-BIT (polynomial x^15 + x^14 + 1)
-//  Chu kỳ: 2^15 - 1 = 32 767 bước
+//  Chu kỳ: 2^15 - 1 = 32 767 bước, mỗi giá trị [1..32767] xuất hiện đúng 1 lần
+//  Dùng cho cả PRBS (lấy bit 0) và Uniform amplitude (normalize state/32767)
 // ============================================================
 uint16_t lfsr_step(uint16_t state) {
-    // Bit feedback = bit14 XOR bit13
     uint16_t bit = ((state >> 14) ^ (state >> 13)) & 1;
     state = ((state << 1) | bit) & 0x7FFF;
-    if (state == 0) state = 1; // tránh trạng thái kẹt tại 0
+    if (state == 0) state = 1; // tránh kẹt tại 0
     return state;
 }
 
 // ============================================================
-//  ÁNH XẠ LFSR STATE → MỨC PWM
-//  Chia đều num_levels mức trong [-amplitude, +amplitude]
-//  idx=0 → -amplitude, idx=num_levels-1 → +amplitude
+//  SINH GIÁ TRỊ PRMS THEO BÀI BÁO (Roman et al.)
+//  PRMS = PRBS_sign × Uniform_random_amplitude
+//
+//  lfsrPRBS : bit 0 → dấu (+1 hoặc -1)
+//  lfsrAmp  : normalize về [0,1] → nhân với amplitude
+//  Kết quả  : phân bố đều trong [-amplitude, +amplitude]
 // ============================================================
-float prmsLevel(uint16_t state, int num_levels, float amplitude) {
-    int idx = (int)(state % (uint16_t)num_levels);
-    float ratio = (num_levels > 1) ? (float)idx / (float)(num_levels - 1) : 0.5f;
-    return amplitude * (2.0f * ratio - 1.0f);
+float prms_sample(uint16_t lfsrPRBS, uint16_t lfsrAmp, float amplitude) {
+    float sign = (lfsrPRBS & 1) ? 1.0f : -1.0f;
+    float uni  = (float)lfsrAmp / 32767.0f;   // ∈ (0, 1]  — phân bố đều
+    return sign * uni * amplitude;             // ∈ [-A, +A]
 }
 
 // ============================================================
@@ -219,7 +279,7 @@ void TaskSweep(void *pvParameters) {
             {
                 pwm_out = 0.0f;
                 sendPWM(pwm_out);
-                Serial.printf("%lu,%.2f,%.2f\n", now_ms, pwm_out * 100.0f, alpha);
+                send_data_packet(now_ms, pwm_out * 100.0f, alpha);
                 if (now_ms - phaseStartMs >= 1000) {
                     phaseStartMs = now_ms;
                     sweepState   = g_nextState; // chuyển sang CHIRP hoặc PRMS
@@ -227,12 +287,15 @@ void TaskSweep(void *pvParameters) {
                     if (g_nextState == STATE_SWEEP) {
                         Serial.println("# CHIRP_START");
                     } else {
-                        // Reset LFSR về seed ban đầu
-                        g_lfsrState    = prmsParams.seed;
+                        // Khởi tạo 2 LFSR độc lập
+                        // LFSR_PRBS: dùng seed gốc
+                        g_lfsrPRBS = prmsParams.seed;
+                        // LFSR_Amp : XOR 0x55AA để đảm bảo độc lập thống kê
+                        g_lfsrAmp  = (uint16_t)(prmsParams.seed ^ 0x55AA) & 0x7FFF;
+                        if (g_lfsrAmp == 0) g_lfsrAmp = 1;
                         g_prmsLastTick = -1;
-                        g_prmsOutput   = prmsLevel(g_lfsrState,
-                                                    prmsParams.num_levels,
-                                                    prmsParams.amplitude);
+                        g_prmsOutput   = prms_sample(g_lfsrPRBS, g_lfsrAmp,
+                                                     prmsParams.amplitude);
                         Serial.println("# PRMS_START");
                     }
                 }
@@ -264,7 +327,7 @@ void TaskSweep(void *pvParameters) {
                 }
 
                 sendPWM(pwm_out);
-                Serial.printf("%lu,%.2f,%.2f\n", now_ms, pwm_out * 100.0f, alpha);
+                send_data_packet(now_ms, pwm_out, alpha);
                 break;
             }
 
@@ -283,13 +346,14 @@ void TaskSweep(void *pvParameters) {
                 // Xác định tick hiện tại dựa trên clock_ms
                 int tick = (int)(t * 1000.0f / (float)prmsParams.clock_ms);
 
-                // Khi sang tick mới → bước LFSR và cập nhật mức output
+                // Khi sang tick mới → bước cả 2 LFSR và cập nhật output
+                // PRMS = PRBS_sign × Uniform_random_amplitude  (theo bài báo)
                 if (tick != g_prmsLastTick) {
                     g_prmsLastTick = tick;
-                    g_lfsrState    = lfsr_step(g_lfsrState);
-                    g_prmsOutput   = prmsLevel(g_lfsrState,
-                                               prmsParams.num_levels,
-                                               prmsParams.amplitude);
+                    g_lfsrPRBS     = lfsr_step(g_lfsrPRBS);  // sinh dấu ±1
+                    g_lfsrAmp      = lfsr_step(g_lfsrAmp);   // sinh biên độ đều [0,A]
+                    g_prmsOutput   = prms_sample(g_lfsrPRBS, g_lfsrAmp,
+                                                 prmsParams.amplitude);
                 }
 
                 pwm_out = prmsParams.offset + g_prmsOutput;
@@ -303,7 +367,7 @@ void TaskSweep(void *pvParameters) {
                 }
 
                 sendPWM(pwm_out);
-                Serial.printf("%lu,%.2f,%.2f\n", now_ms, pwm_out * 100.0f, alpha);
+                send_data_packet(now_ms, pwm_out, alpha);
                 break;
             }
 
@@ -316,9 +380,9 @@ void TaskSweep(void *pvParameters) {
                                    params.f_start, params.f_end,
                                    params.amplitude, params.offset, params.duration);
                 } else {
-                    Serial.printf("# [PRMS]  clk=%dms  A=%.2f  off=%.2f  T=%.0fs  levels=%d  seed=%d\n",
+                    Serial.printf("# [PRMS]  clk=%dms  A=%.2f  off=%.2f  T=%.0fs  seed=%d\n",
                                    prmsParams.clock_ms, prmsParams.amplitude, prmsParams.offset,
-                                   prmsParams.duration, prmsParams.num_levels, prmsParams.seed);
+                                   prmsParams.duration, prmsParams.seed);
                 }
                 sweepState = STATE_IDLE;
                 break;
@@ -407,8 +471,10 @@ void TaskSerial(void *pvParameters) {
             }
 
             // ── LỆNH r: bắt đầu PRMS ────────────────────────
-            // Cú pháp: r <amplitude> <offset> <clock_ms> <duration> <num_levels> <seed>
-            // Ví dụ:   r 0.5 0.0 100 60 3 1
+            // Theo bài báo Roman et al.: PRMS = PRBS_sign × Uniform_random_amp
+            // Cú pháp: r <amplitude> <offset> <clock_ms> <duration> <seed>
+            // Ví dụ:   r 0.4 0.0 4000 508 1
+            //   clock_ms = 1000 / (2.5 × BW_Hz)  →  BW=0.1Hz → 4000ms
             else if (cmd == 'r') {
                 if (sweepState != STATE_IDLE) {
                     Serial.println("# ERR: dang chay, gui 's' de dung truoc");
@@ -417,15 +483,15 @@ void TaskSerial(void *pvParameters) {
                 }
 
                 float amp, off, dur;
-                int clk_ms, nlevels;
+                int   clk_ms;
                 unsigned int seed_val;
-                int parsed = sscanf(input.c_str(), "r %f %f %d %f %d %u",
-                                    &amp, &off, &clk_ms, &dur, &nlevels, &seed_val);
+                int parsed = sscanf(input.c_str(), "r %f %f %d %f %u",
+                                    &amp, &off, &clk_ms, &dur, &seed_val);
 
-                if (parsed != 6) {
+                if (parsed != 5) {
                     Serial.println("# ERR: cu phap sai");
-                    Serial.println("# Vi du: r 0.5 0.0 100 60 3 1");
-                    Serial.println("#   amplitude offset clock_ms duration num_levels seed");
+                    Serial.println("# Vi du: r 0.4 0.0 4000 508 1");
+                    Serial.println("#        amplitude offset clock_ms duration seed");
                     vTaskDelay(pdMS_TO_TICKS(100));
                     continue;
                 }
@@ -444,35 +510,35 @@ void TaskSerial(void *pvParameters) {
                     vTaskDelay(pdMS_TO_TICKS(100));
                     continue;
                 }
-                if (nlevels < 2 || nlevels > 9) {
-                    Serial.println("# ERR: num_levels phai trong khoang [2, 9]");
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    continue;
-                }
                 if (seed_val == 0 || seed_val > 32767) {
                     Serial.println("# ERR: seed phai trong khoang [1, 32767]");
                     vTaskDelay(pdMS_TO_TICKS(100));
                     continue;
                 }
 
-                prmsParams.amplitude  = amp;
-                prmsParams.offset     = off;
-                prmsParams.clock_ms   = (uint16_t)clk_ms;
-                prmsParams.duration   = dur;
-                prmsParams.num_levels = nlevels;
-                prmsParams.seed       = (uint16_t)seed_val;
+                prmsParams.amplitude = amp;
+                prmsParams.offset    = off;
+                prmsParams.clock_ms  = (uint16_t)clk_ms;
+                prmsParams.duration  = dur;
+                prmsParams.seed      = (uint16_t)seed_val;
+
+                // Seed LFSR_Amp = seed XOR 0x55AA (đảm bảo độc lập thống kê)
+                uint16_t amp_seed = (uint16_t)(seed_val ^ 0x55AA) & 0x7FFF;
+                if (amp_seed == 0) amp_seed = 1;
 
                 g_nextState  = STATE_PRMS;
                 phaseStartMs = millis();
                 sweepState   = STATE_BASELINE;
 
                 Serial.println("# ============================================");
-                Serial.printf("# PRMS: A=%.3f  off=%.3f  clk=%dms  T=%.0fs  levels=%d  seed=%d\n",
-                               amp, off, clk_ms, dur, nlevels, seed_val);
-                Serial.printf("# Buoc chuyen doi: %.1f Hz  |  Sample rate: %d Hz  |  Baud: %d\n",
-                               1000.0f / clk_ms, 1000 / SAMPLE_MS, SERIAL_BAUD);
-                Serial.printf("# Chu ky LFSR: 32767 buoc = %.1f s\n",
-                               32767.0f * clk_ms / 1000.0f);
+                Serial.printf("# PRMS (PRBS × Uniform Amp): A=%.3f  off=%.3f  clk=%dms  T=%.0fs  seed=%d\n",
+                               amp, off, clk_ms, dur, seed_val);
+                Serial.printf("# f_c=%.4fHz  f_upper=f_c/3=%.4fHz  f_lower=f_c/N\n",
+                               1000.0f / clk_ms, 1000.0f / clk_ms / 3.0f);
+                Serial.printf("# LFSR_PRBS seed=%d  LFSR_Amp seed=%d (auto)\n",
+                               seed_val, amp_seed);
+                Serial.printf("# Sample rate: %d Hz  |  Baud: %d\n",
+                               1000 / SAMPLE_MS, SERIAL_BAUD);
                 Serial.println("# t_ms,pwm_pct,alpha_deg");
                 Serial.println("# ============================================");
                 Serial.println("# BASELINE_START");
@@ -504,8 +570,10 @@ void TaskSerial(void *pvParameters) {
                 } else if (sweepState == STATE_PRMS) {
                     float elapsed = (float)(millis() - phaseStartMs) / 1000.0f;
                     int tick = (int)(elapsed * 1000.0f / prmsParams.clock_ms);
-                    Serial.printf("# [PRMS]  Progress: %.1f%%  tick=%d  output=%.3f\n",
+                    Serial.printf("# [PRMS]  Progress: %.1f%%  tick=%d  pwm_out=%.3f\n",
                                    elapsed / prmsParams.duration * 100.0f, tick, g_prmsOutput);
+                    Serial.printf("# [PRMS]  LFSR_PRBS=0x%04X  LFSR_Amp=0x%04X\n",
+                                   g_lfsrPRBS, g_lfsrAmp);
                 }
             }
 
