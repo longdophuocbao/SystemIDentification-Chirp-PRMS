@@ -268,28 +268,46 @@ class RealTimeGui(QtWidgets.QMainWindow):
         prms_form = QtWidgets.QFormLayout(prms_page)
         prms_form.setContentsMargins(0, 0, 0, 0)
 
-        self.prms_clock_ms = QtWidgets.QLineEdit("1000")
+        self.prms_clock_ms = QtWidgets.QLineEdit("4000")
         self.prms_clock_ms.setToolTip(
-            "Thời gian giữ mỗi bước (ms). Phải >= 20ms (chu kỳ lấy mẫu).\n"
-            "Theo bài báo: clock_ms = 1000 / (2.5 × f_bandwidth)\n"
-            "  BW = 0.1 Hz → clock_ms = 4000 ms (4 s/bước)\n"
-            "  BW = 1.0 Hz → clock_ms = 400 ms\n"
-            "  BW = 5.0 Hz → clock_ms = 80 ms"
+            "clock_ms = 1000 / (2.5 × BW_Hz)\n"
+            "  BW = 0.1 Hz → 4000 ms  |  BW = 1 Hz → 400 ms"
         )
+        self.prms_clock_ms.textChanged.connect(self._update_prms_duration_label)
 
-        self.prms_seed = QtWidgets.QLineEdit("1000")
+        # PRBS bit-length selector (thay cho duration — duration tự tính)
+        # n  N=2^n-1  @4s/step   ghi chú
+        # 7   127      508s       thực tế BW=0.1Hz
+        # 9   511      2044s
+        # 10  1023     4092s      bài báo Roman et al.
+        self.prms_nbits = QtWidgets.QComboBox()
+        self._NBITS_VALUES = [7, 9, 10]
+        self._NBITS_PERIODS = {7: 127, 9: 511, 10: 1023}
+        self.prms_nbits.addItem(" 7-bit  (N=127,  ~8.5 min @ 4s/step)")
+        self.prms_nbits.addItem(" 9-bit  (N=511,  ~34  min @ 4s/step)")
+        self.prms_nbits.addItem("10-bit  (N=1023, ~68  min @ 4s/step)  ← bài báo")
+        self.prms_nbits.setCurrentIndex(0)
+        self.prms_nbits.setToolTip(
+            "Số bit PRBS. Duration = N × clock_ms/1000 (1 chu kỳ đầy đủ)\n"
+            "Bài báo Roman et al. dùng 10-bit với clock=30ms → 31 giây.\n"
+            "Hệ thống BW=0.1Hz: dùng 7-bit với clock=4000ms → 8.5 phút."
+        )
+        self.prms_nbits.currentIndexChanged.connect(self._update_prms_duration_label)
+
+        # Label duration tự tính (read-only, cập nhật realtime)
+        self.prms_dur_label = QtWidgets.QLabel("Duration: 508 s  (127 bước × 4 s)")
+        self.prms_dur_label.setStyleSheet("color: #74c0fc; font-size: 11px; padding: 1px 2px;")
+
+        self.prms_seed = QtWidgets.QLineEdit("1")
         self.prms_seed.setToolTip(
-            "Seed cho LFSR_PRBS [1–32767].\n"
-            "LFSR_Amp seed = seed XOR 0x55AA (tự động, độc lập thống kê).\n"
-            "Thay đổi seed → chuỗi khác, cùng tính chất phổ.\n"
-            "Chu kỳ LFSR 15-bit = 32767 bước."
+            "Seed LFSR_PRBS [1..N].\n"
+            "LFSR_Amp seed = seed XOR 0x55AA (tự động).\n"
+            "Đổi seed → chuỗi khác, cùng tính chất phổ."
         )
 
-        # Nhãn giải thích phương pháp
         self.prms_method_label = QtWidgets.QLabel(
-            "<small><b>PRMS = PRBS_sign × Uniform_random_amp</b><br>"
-            "Biên độ phân bố đều trong [−A, +A] — theo Roman et al.<br>"
-            "<i>clock_ms = 1000 / (2.5 × BW_Hz) &nbsp;|&nbsp; duration ≥ 127 × clock_s</i></small>"
+            "<small><b>PRMS = PRBS_sign × Uniform_amp</b>  (Roman et al.)<br>"
+            "1 chu kỳ PRBS đầy đủ → phổ phẳng hoàn hảo</small>"
         )
         self.prms_method_label.setStyleSheet(
             "color: #aaa; padding: 3px; border: 1px solid #444; border-radius: 3px;"
@@ -297,7 +315,9 @@ class RealTimeGui(QtWidgets.QMainWindow):
         self.prms_method_label.setWordWrap(True)
 
         prms_form.addRow("Clock Period (ms):", self.prms_clock_ms)
-        prms_form.addRow("LFSR Seed:", self.prms_seed)
+        prms_form.addRow("PRBS bits:", self.prms_nbits)
+        prms_form.addRow(self.prms_dur_label)
+        prms_form.addRow("Seed:", self.prms_seed)
         prms_form.addRow(self.prms_method_label)
         self.sig_stack.addWidget(prms_page)
 
@@ -423,6 +443,24 @@ class RealTimeGui(QtWidgets.QMainWindow):
         plot_layout.addWidget(self.pw_alpha)
 
     # ──────────────────────────────────────────────────────────
+    #  Cập nhật label duration khi clock_ms hoặc n_bits thay đổi
+    # ──────────────────────────────────────────────────────────
+    def _update_prms_duration_label(self):
+        try:
+            clk_ms  = int(self.prms_clock_ms.text())
+            nb_idx  = self.prms_nbits.currentIndex()
+            n_bits  = self._NBITS_VALUES[nb_idx]
+            N       = self._NBITS_PERIODS[n_bits]
+            dur_s   = N * clk_ms / 1000.0
+            dur_min = dur_s / 60.0
+            self.prms_dur_label.setText(
+                f"Duration: {dur_s:.0f} s  ({N} bước × {clk_ms/1000:.1f} s"
+                f"  ≈ {dur_min:.1f} min)"
+            )
+        except (ValueError, IndexError):
+            self.prms_dur_label.setText("Duration: –")
+
+    # ──────────────────────────────────────────────────────────
     #  Xử lý thay đổi loại tín hiệu
     # ──────────────────────────────────────────────────────────
     def on_signal_type_changed(self, idx):
@@ -490,10 +528,11 @@ class RealTimeGui(QtWidgets.QMainWindow):
             cmd = (f"w {self.f_start.text()} {self.f_end.text()} "
                    f"{self.amplitude.text()} {self.offset.text()} {self.duration.text()}")
         else:
-            # PRMS: r <amplitude> <offset> <clock_ms> <duration> <seed>
-            # PRMS = PRBS_sign × Uniform_random_amp  (theo Roman et al.)
+            # PRMS: r <amplitude> <offset> <clock_ms> <n_bits> <seed>
+            # Duration tự tính trên ESP32 = N × clock_ms/1000 (1 chu kỳ PRBS)
+            nb = self._NBITS_VALUES[self.prms_nbits.currentIndex()]
             cmd = (f"r {self.amplitude.text()} {self.offset.text()} "
-                   f"{self.prms_clock_ms.text()} {self.duration.text()} "
+                   f"{self.prms_clock_ms.text()} {nb} "
                    f"{self.prms_seed.text()}")
 
         self.reader.send(cmd)
